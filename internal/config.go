@@ -2,7 +2,7 @@ package internal
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 
 	"gopkg.in/yaml.v3"
 )
@@ -27,7 +27,7 @@ type Config struct {
 
 // LoadConfig memuat konfigurasi dari file YAML.
 func LoadConfig(path string) (*Config, error) {
-	data, err := ioutil.ReadFile(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("gagal membaca config file %s: %w", path, err)
 	}

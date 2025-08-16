@@ -10,14 +10,14 @@ import (
 	"time"
 )
 
-// InternalAuth mewakili otentikasi internal antar node Raft.
+// Auth mewakili otentikasi internal antar node Raft.
 // Ini digunakan untuk memastikan bahwa permintaan antar node aman dan terverifikasi.
 // Ini menggunakan HMAC dengan shared secret untuk menandatangani permintaan.
 // NodeID adalah ID unik untuk node yang mengirim permintaan.
 // Secret adalah shared secret yang digunakan untuk HMAC.
 // Skew adalah toleransi clock skew antara node (mis. 60 detik).
 // Allowlist opsional: daftar ID peer yang diizinkan untuk mengirim permintaan.
-type InternalAuth struct {
+type Auth struct {
 	NodeID    string           // ID node pengirim (untuk SignRequest)
 	Secret    string           // shared secret antar node
 	Skew      time.Duration    // toleransi clock skew, mis. 60 * time.Second
@@ -25,7 +25,7 @@ type InternalAuth struct {
 	Now       func() time.Time // opsional: stub untuk pengujian; default time.Now().UTC
 }
 
-func (a InternalAuth) nowUTC() time.Time {
+func (a Auth) nowUTC() time.Time {
 	if a.Now != nil {
 		return a.Now().UTC()
 	}
@@ -42,7 +42,7 @@ func canonicalTarget(r *http.Request) string {
 	return uri
 }
 
-func (a InternalAuth) signString(method, target string, body []byte, ts string) string {
+func (a Auth) signString(method, target string, body []byte, ts string) string {
 	mac := hmac.New(sha256.New, []byte(a.Secret))
 	// method \n target \n body \n ts
 	mac.Write([]byte(strings.ToUpper(method)))
@@ -56,7 +56,7 @@ func (a InternalAuth) signString(method, target string, body []byte, ts string) 
 }
 
 // VerifyOrError verifikasi detail (mengembalikan alasan jika gagal).
-func (a InternalAuth) VerifyOrError(r *http.Request, body []byte) error {
+func (a Auth) verifyOrError(r *http.Request, body []byte) error {
 	id := r.Header.Get("X-Internal-Id")
 	ts := r.Header.Get("X-Internal-Ts")
 	sig := r.Header.Get("X-Internal-Sign")
@@ -88,12 +88,12 @@ func (a InternalAuth) VerifyOrError(r *http.Request, body []byte) error {
 }
 
 // VerifyRequest versi ringkas (true/false).
-func (a InternalAuth) VerifyRequest(r *http.Request, body []byte) bool {
-	return a.VerifyOrError(r, body) == nil
+func (a Auth) VerifyRequest(r *http.Request, body []byte) bool {
+	return a.verifyOrError(r, body) == nil
 }
 
 // SignRequest menandatangani permintaan internal.
-func (a InternalAuth) SignRequest(req *http.Request, rawBody []byte) {
+func (a Auth) SignRequest(req *http.Request, rawBody []byte) {
 	ts := strconv.FormatInt(a.nowUTC().Unix(), 10)
 	target := canonicalTarget(req)
 	sig := a.signString(req.Method, target, rawBody, ts)
@@ -105,22 +105,22 @@ func (a InternalAuth) SignRequest(req *http.Request, rawBody []byte) {
 // --- Errors (opsional typed errors) ---
 var (
 	// ErrAuthMissingHeaders jika permintaan tidak memiliki header yang diperlukan.
-	ErrAuthMissingHeaders = &AuthError{"missing headers"}
+	ErrAuthMissingHeaders = &authError{"missing headers"}
 
 	// ErrAuthPeerNotAllowed jika ID peer tidak ada dalam allowlist.
-	ErrAuthPeerNotAllowed = &AuthError{"peer not allowed"}
-	
+	ErrAuthPeerNotAllowed = &authError{"peer not allowed"}
+
 	// ErrAuthBadTimestamp jika timestamp tidak valid (tidak bisa di-parse).
-	ErrAuthBadTimestamp   = &AuthError{"bad timestamp"}
+	ErrAuthBadTimestamp = &authError{"bad timestamp"}
 
 	// ErrAuthSkew jika timestamp terlalu jauh dari waktu sekarang (clock skew).
-	ErrAuthSkew           = &AuthError{"timestamp out of range"}
+	ErrAuthSkew = &authError{"timestamp out of range"}
 
 	// ErrAuthBadSignature jika signature tidak cocok.
-	ErrAuthBadSignature   = &AuthError{"bad signature"}
+	ErrAuthBadSignature = &authError{"bad signature"}
 )
 
 // AuthError mewakili kesalahan otentikasi internal.
-type AuthError struct{ msg string }
+type authError struct{ msg string }
 
-func (e *AuthError) Error() string { return "internal auth: " + e.msg }
+func (e *authError) Error() string { return "internal auth: " + e.msg }

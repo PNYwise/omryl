@@ -82,7 +82,7 @@ func main() {
 		node.SetPublicJoinToken(cfg.PublicJoinToken)
 	}
 	if cfg.InternalSecret != "" {
-		node.SetInternalAuth(&internal.InternalAuth{
+		node.SetInternalAuth(&internal.Auth{
 			NodeID: cfg.InternalID,
 			Secret: cfg.InternalSecret,
 			Skew:   time.Duration(cfg.InternalClockSkewSec) * time.Second,

@@ -25,7 +25,7 @@ type RaftNode struct {
 	httpAddrBook    map[string]string
 	publicAPIToken  string // simple token for /purpose, /query
 	publicJoinToken string // simple token for /join
-	internalAuth    *InternalAuth
+	internalAuth    *Auth
 }
 
 // Setters for auth (call from main after construction)
@@ -37,7 +37,7 @@ func (rn *RaftNode) SetPublicAPIToken(tok string) { rn.publicAPIToken = tok }
 func (rn *RaftNode) SetPublicJoinToken(tok string) { rn.publicJoinToken = tok }
 
 // SetInternalAuth mengatur otentikasi internal antar node.
-func (rn *RaftNode) SetInternalAuth(a *InternalAuth) { rn.internalAuth = a }
+func (rn *RaftNode) SetInternalAuth(a *Auth) { rn.internalAuth = a }
 
 // NewRaftNode menginisialisasi dan mengembalikan node Raft baru.
 func NewRaftNode(

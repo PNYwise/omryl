@@ -3,177 +3,280 @@ package internal
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/hashicorp/raft"
 )
 
-// SQLiteFSM adalah Finite State Machine (FSM) untuk Raft, yang mengelola database SQLite.
+// SQLiteFSM kelola DB + lastApplied
 type SQLiteFSM struct {
 	dbPath      string
 	db          *sql.DB
-	mu          sync.Mutex // Melindungi akses ke database SQLite
+	mu          sync.RWMutex // -> RWMutex untuk read-heavy ops
 	lastApplied uint64
 }
+
+// Pastikan SQLiteFSM mengimplementasikan raft.FSM
+var _ raft.FSM = (*SQLiteFSM)(nil)
 
 // NewSQLiteFSM membuat instance SQLiteFSM baru dan menginisialisasi database.
 func NewSQLiteFSM(dbPath string) *SQLiteFSM {
 	fsm := &SQLiteFSM{dbPath: dbPath}
-	var err error
-	fsm.db, err = sql.Open("sqlite3", dbPath)
+
+	// Gunakan URI + PRAGMA di DSN agar pasti diterapkan pada koneksi pertama.
+	// Catatan: go-sqlite3 butuh "file:<path>?<params>" untuk URI.
+	dsn := fmt.Sprintf(
+		"file:%s?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL&_synchronous=NORMAL",
+		dbPath,
+	)
+
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		log.Fatalf("Gagal membuka database SQLite untuk FSM: %v", err)
 	}
 
-	// Buat tabel contoh jika belum ada.
-	// Ini adalah perintah DDL yang juga akan direplikasi jika diajukan melalui Raft.
-	_, err = fsm.db.Exec(`
-		CREATE TABLE IF NOT EXISTS items (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL,
-			quantity INTEGER NOT NULL
-		);
-	`)
-	if err != nil {
+	// Pooling & concurrency:
+	// - 1 koneksi cukup untuk writer tunggal (Raft Apply), reader lokal juga jalan dengan WAL.
+	//   Naikkan jika benar-benar perlu, tapi hati-hati lock.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+
+	fsm.db = db
+
+	// (Opsional) PRAGMA tambahan; jika DSN sudah mengatur, ini jadi no-op.
+	if _, e := fsm.db.Exec(`PRAGMA journal_mode=WAL;`); e != nil {
+		log.Printf("PRAGMA WAL: %v", e)
+	}
+	if _, e := fsm.db.Exec(`PRAGMA synchronous=NORMAL;`); e != nil {
+		log.Printf("PRAGMA sync: %v", e)
+	}
+	if _, e := fsm.db.Exec(`PRAGMA foreign_keys=ON;`); e != nil {
+		log.Printf("PRAGMA fk: %v", e)
+	}
+	if _, e := fsm.db.Exec(`PRAGMA busy_timeout=5000;`); e != nil {
+		log.Printf("PRAGMA busy: %v", e)
+	}
+
+	// Schema
+	if _, err = fsm.db.Exec(`
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            quantity INTEGER NOT NULL
+        );
+    `); err != nil {
 		log.Fatalf("Gagal membuat tabel di database FSM: %v", err)
 	}
-	fsm.InitMeta()
-	log.Printf("Database SQLite FSM berhasil diinisialisasi di: %s", dbPath)
+
+	fsm.initMeta()
+	log.Printf("SQLite (go-sqlite3) siap di: %s", dbPath)
 	return fsm
 }
 
-// InitMeta Tambahkan fungsi untuk inisialisasi dan load lastApplied
-func (fsm *SQLiteFSM) InitMeta() {
-	_, err := fsm.db.Exec(`CREATE TABLE IF NOT EXISTS raft_meta (id INTEGER PRIMARY KEY, last_applied INTEGER NOT NULL DEFAULT 0);`)
-	if err != nil {
+// initMeta: inisialisasi & load lastApplied
+func (fsm *SQLiteFSM) initMeta() {
+	if _, err := fsm.db.Exec(`CREATE TABLE IF NOT EXISTS raft_meta (
+		id INTEGER PRIMARY KEY,
+		last_applied INTEGER NOT NULL DEFAULT 0
+	);`); err != nil {
 		log.Fatalf("Gagal membuat tabel raft_meta: %v", err)
 	}
 	var idx uint64
-	err = fsm.db.QueryRow(`SELECT last_applied FROM raft_meta WHERE id=1;`).Scan(&idx)
-	if err == sql.ErrNoRows {
-		_, err = fsm.db.Exec(`INSERT INTO raft_meta (id, last_applied) VALUES (1, 0);`)
-		if err != nil {
-			log.Fatalf("Gagal insert initial raft_meta: %v", err)
+	err := fsm.db.QueryRow(`SELECT last_applied FROM raft_meta WHERE id=1;`).Scan(&idx)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, e := fsm.db.Exec(`INSERT INTO raft_meta (id, last_applied) VALUES (1, 0);`); e != nil {
+			log.Fatalf("Gagal insert initial raft_meta: %v", e)
 		}
 		fsm.lastApplied = 0
-	} else if err != nil {
+	case err != nil:
 		log.Fatalf("Gagal membaca raft_meta: %v", err)
-	} else {
+	default:
 		fsm.lastApplied = idx
 	}
 }
 
-// UpdateLastApplied memperbarui nilai last_applied di tabel raft_meta.
-func (fsm *SQLiteFSM) UpdateLastApplied(idx uint64) {
-	_, err := fsm.db.Exec(`UPDATE raft_meta SET last_applied=? WHERE id=1;`, idx)
-	if err != nil {
+// updateLastApplied: prepared update (sedikit hemat alloc)
+func (fsm *SQLiteFSM) updateLastApplied(idx uint64) {
+	if _, err := fsm.db.Exec(`UPDATE raft_meta SET last_applied=? WHERE id=1;`, idx); err != nil {
 		log.Printf("Gagal update last_applied: %v", err)
 	}
 }
 
-// Apply dipanggil oleh Raft ketika sebuah log telah disepakati dan siap untuk diterapkan ke FSM.
-func (fsm *SQLiteFSM) Apply(logEntry *raft.Log) any {
+// Apply dipanggil oleh Raft ketika log siap diterapkan.
+func (fsm *SQLiteFSM) Apply(le *raft.Log) any {
 	fsm.mu.Lock()
 	defer fsm.mu.Unlock()
 
-	if logEntry.Index <= fsm.lastApplied {
-		log.Printf("Log #%d sudah diterapkan, skip.", logEntry.Index)
+	// Idempotensi: lewati log lama
+	if le.Index <= fsm.lastApplied {
+		// log.Printf("Log #%d sudah diterapkan, skip.", le.Index)
 		return nil
 	}
 
 	var cmd Command
-	if err := json.Unmarshal(logEntry.Data, &cmd); err != nil {
-		log.Printf("Gagal meng-unmarshal perintah dari log Raft: %v", err)
-		return fmt.Errorf("gagal meng-unmarshal perintah: %w", err)
+	if err := json.Unmarshal(le.Data, &cmd); err != nil {
+		log.Printf("Unmarshal perintah dari log Raft gagal: %v", err)
+		return fmt.Errorf("unmarshal perintah: %w", err)
 	}
 
-	log.Printf("Menerapkan perintah SQL: %s", cmd.SQL)
-	_, err := fsm.db.Exec(cmd.SQL)
-	if err != nil {
-		log.Printf("Kesalahan saat mengeksekusi SQL '%s': %v", cmd.SQL, err)
-		return fmt.Errorf("kesalahan saat mengeksekusi SQL: %w", err)
+	sqlText := strings.TrimSpace(cmd.SQL)
+	if sqlText == "" {
+		// Jangan eksekusi SQL kosong
+		log.Printf("Peringatan: SQL kosong pada index %d, diabaikan.", le.Index)
+		fsm.lastApplied = le.Index
+		fsm.updateLastApplied(le.Index)
+		return nil
 	}
 
-	fsm.lastApplied = logEntry.Index
-	fsm.UpdateLastApplied(logEntry.Index)
+	// Eksekusi
+	if _, err := fsm.db.Exec(sqlText); err != nil {
+		log.Printf("Kesalahan saat eksekusi SQL (idx=%d): %v; sql=%q", le.Index, err, limitLen(sqlText, 200))
+		return fmt.Errorf("exec sql: %w", err)
+	}
+
+	fsm.lastApplied = le.Index
+	fsm.updateLastApplied(le.Index)
 	return nil
 }
 
-// Snapshot digunakan untuk membuat snapshot FSM (keadaan database).
-// Ini penting untuk pemangkasan log Raft dan pemulihan node.
+// Snapshot buat snapshot konsisten.
+// Gunakan VACUUM INTO jika ada (SQLite >= 3.27); fallback ke copy file biasa.
 func (fsm *SQLiteFSM) Snapshot() (raft.FSMSnapshot, error) {
-	fsm.mu.Lock()
-	defer fsm.mu.Unlock()
+	fsm.mu.RLock() // read lock saja cukup; tulis diblok oleh Apply (Lock)
+	defer fsm.mu.RUnlock()
 
-	// Untuk SQLite, snapshot berarti menyalin seluruh file database.
-	// Ini bisa menjadi operasi yang mahal untuk database besar atau yang sangat aktif.
-	// Untuk aplikasi produksi yang sangat besar, pertimbangkan menggunakan:
-	// 1. SQLite Online Backup API (melalui cgo) untuk backup non-blocking.
-	// 2. Pendekatan log-structured storage atau database yang dirancang untuk snapshotting.
-	// 3. Hanya mengambil snapshot jika database tidak aktif menulis.
-
-	tmpFile, err := os.CreateTemp("", "sqlite_snapshot_*.db")
+	tmp, err := os.CreateTemp("", "sqlite_snapshot_*.db")
 	if err != nil {
-		return nil, fmt.Errorf("gagal membuat file sementara untuk snapshot: %w", err)
+		return nil, fmt.Errorf("buat file sementara snapshot: %w", err)
 	}
-	defer tmpFile.Close() // Pastikan file temp ditutup
+	tmpName := tmp.Name()
+	_ = tmp.Close()
 
-	sourceFile, err := os.Open(fsm.dbPath)
-	if err != nil {
-		os.Remove(tmpFile.Name()) // Bersihkan file temp jika gagal
-		return nil, fmt.Errorf("gagal membuka database sumber untuk snapshot: %w", err)
-	}
-	defer sourceFile.Close()
-
-	if _, err := io.Copy(tmpFile, sourceFile); err != nil {
-		os.Remove(tmpFile.Name()) // Bersihkan file temp jika gagal
-		return nil, fmt.Errorf("gagal menyalin database untuk snapshot: %w", err)
+	// Coba VACUUM INTO untuk file yang koheren saat WAL
+	if _, err := fsm.db.Exec(`VACUUM INTO ?;`, tmpName); err != nil {
+		// Fallback: copy file
+		os.Remove(tmpName)
+		if copyErr := copyFile(fsm.dbPath, tmpName); copyErr != nil {
+			return nil, fmt.Errorf("snapshot gagal (vacuum=%v, copy=%v)", err, copyErr)
+		}
 	}
 
-	log.Printf("Snapshot SQLite dibuat di: %s", tmpFile.Name())
-	return &SQLiteSnapshot{snapshotPath: tmpFile.Name()}, nil
+	log.Printf("Snapshot SQLite dibuat di: %s", tmpName)
+	return &SQLiteSnapshot{snapshotPath: tmpName}, nil
 }
 
-// Restore dipanggil untuk mengembalikan FSM dari snapshot.
+// SQLiteSnapshot implementasi FSMSnapshot – salin file snapshot ke sink, lalu bersihkan.
+type SQLiteSnapshot struct {
+	snapshotPath string
+}
+
+var _ raft.FSMSnapshot = (*SQLiteSnapshot)(nil)
+
+// Persist menyalin snapshot ke sink Raft.
+func (s *SQLiteSnapshot) Persist(sink raft.SnapshotSink) error {
+	defer sink.Close()
+
+	src, err := os.Open(s.snapshotPath)
+	if err != nil {
+		sink.Cancel()
+		return fmt.Errorf("buka snapshot: %w", err)
+	}
+	defer src.Close()
+
+	if _, err := io.Copy(sink, src); err != nil {
+		sink.Cancel()
+		return fmt.Errorf("copy snapshot: %w", err)
+	}
+	return nil
+}
+
+// Release membersihkan snapshot file setelah disimpan.
+func (s *SQLiteSnapshot) Release() {
+	if s.snapshotPath != "" {
+		_ = os.Remove(s.snapshotPath)
+	}
+}
+
+// Restore timpa file DB dengan snapshot & reload lastApplied
 func (fsm *SQLiteFSM) Restore(rc io.ReadCloser) error {
 	fsm.mu.Lock()
 	defer fsm.mu.Unlock()
 	defer rc.Close()
 
-	log.Printf("Memulai pemulihan database SQLite dari snapshot...")
+	log.Printf("Memulai restore database SQLite dari snapshot...")
 
-	// Tutup koneksi DB yang ada sebelum menghapus dan menulis ulang file.
+	// Tutup koneksi lama bila ada
 	if fsm.db != nil {
 		if err := fsm.db.Close(); err != nil {
-			log.Printf("Peringatan: Gagal menutup koneksi DB yang ada sebelum restore: %v", err)
+			log.Printf("Peringatan: gagal menutup koneksi DB sebelum restore: %v", err)
 		}
 	}
 
-	// Hapus file DB yang ada
-	if err := os.Remove(fsm.dbPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("gagal menghapus database yang ada sebelum restore: %w", err)
-	}
-
-	// Buat file baru dan salin data snapshot ke dalamnya
-	newFile, err := os.Create(fsm.dbPath)
+	// Timpa file database
+	tmp := fsm.dbPath + ".restore.tmp"
+	out, err := os.Create(tmp)
 	if err != nil {
-		return fmt.Errorf("gagal membuat file database untuk restore: %w", err)
+		return fmt.Errorf("buat file sementara restore: %w", err)
 	}
-	defer newFile.Close()
+	if _, err := io.Copy(out, rc); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("salin snapshot ke file sementara: %w", err)
+	}
+	out.Close()
 
-	if _, err := io.Copy(newFile, rc); err != nil {
-		return fmt.Errorf("gagal menyalin data snapshot ke file database baru: %w", err)
+	// Replace atomically
+	if err := os.Rename(tmp, fsm.dbPath); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename file restore: %w", err)
 	}
 
-	// Buka kembali koneksi DB
-	fsm.db, err = sql.Open("sqlite3", fsm.dbPath)
+	// Reopen DB dan reload meta
+	db, err := sql.Open("sqlite3", fsm.dbPath)
 	if err != nil {
-		return fmt.Errorf("gagal membuka database SQLite yang dipulihkan: %w", err)
+		return fmt.Errorf("buka DB setelah restore: %w", err)
 	}
-	log.Printf("Database SQLite berhasil dipulihkan ke: %s", fsm.dbPath)
+	fsm.db = db
+	fsm.initMeta() // <-- penting: set ulang lastApplied dari raft_meta
+
+	log.Printf("Restore selesai ke: %s (lastApplied=%d)", fsm.dbPath, fsm.lastApplied)
 	return nil
+}
+
+// --- util kecil ---
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = out.Close()
+	}()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+func limitLen(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...(truncated)"
 }
