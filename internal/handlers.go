@@ -170,7 +170,7 @@ func (rn *RaftNode) HandleQuery(w http.ResponseWriter, r *http.Request) {
 	rn.fsm.mu.Lock()
 	defer rn.fsm.mu.Unlock()
 
-	rows, err := rn.fsm.db.Query("SELECT id, name, quantity FROM items;")
+	rows, err := rn.fsm.db.Query("SELECT id, name, quantity FROM items ORDER BY id DESC LIMIT 10;")
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Gagal mengkueri data: %v", err), http.StatusInternalServerError)
 		return
