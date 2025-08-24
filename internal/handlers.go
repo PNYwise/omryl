@@ -11,50 +11,14 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// Command merepresentasikan perintah SQL yang akan direplikasi.
-type Command struct {
-	SQL string `json:"sql"`
-}
-
-type joinReq struct {
-	ID       string `json:"id"`
-	RaftAddr string `json:"address"` // raft addr
-	HTTPAddr string `json:"http"`    // http addr
-}
-
-// Public/simple token gate
-func (rn *RaftNode) requirePublicAPI(w http.ResponseWriter, r *http.Request) bool {
-	if rn.publicAPIToken == "" {
-		return true
-	}
-	if r.Header.Get("X-Token") == rn.publicAPIToken {
-		return true
-	}
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
-	return false
-}
-func (rn *RaftNode) requirePublicJoin(w http.ResponseWriter, r *http.Request) bool {
-	tok := r.Header.Get("X-Token")
-	if rn.publicJoinToken != "" && tok == rn.publicJoinToken {
-		return true
-	}
-	if rn.publicAPIToken != "" && tok == rn.publicAPIToken {
-		return true
-	}
-	if rn.publicJoinToken == "" && rn.publicAPIToken == "" {
-		return true
-	}
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
-	return false
-}
-
 // HandlePurpose PUBLIC endpoint (simple token) → proxy to leader /propose (HMAC)
 func (rn *RaftNode) HandlePurpose(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Metode tidak diizinkan", http.StatusMethodNotAllowed)
 		return
 	}
-	if !rn.requirePublicAPI(w, r) {
+	if !rn.publicAuth.VerifyRequest(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	body, err := io.ReadAll(r.Body)
@@ -100,6 +64,11 @@ func (rn *RaftNode) HandlePurpose(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Gagal mengajukan perintah: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	if rn.federatePurpose && rn.HasCommittee() {
+		go rn.fanoutSQL(req.SQL)
+	}
+
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("Perintah berhasil diajukan dan akan direplikasi."))
 }
@@ -163,12 +132,13 @@ func (rn *RaftNode) HandleQuery(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Metode tidak diizinkan", http.StatusMethodNotAllowed)
 		return
 	}
-	if !rn.requirePublicAPI(w, r) {
+	if !rn.publicAuth.VerifyRequest(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	rn.fsm.mu.Lock()
-	defer rn.fsm.mu.Unlock()
+	rn.fsm.mu.RLock()
+	defer rn.fsm.mu.RUnlock()
 
 	rows, err := rn.fsm.db.Query("SELECT id, name, quantity FROM items ORDER BY id DESC LIMIT 10;")
 	if err != nil {
@@ -205,7 +175,8 @@ func (rn *RaftNode) HandleJoin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Metode tidak diizinkan", http.StatusMethodNotAllowed)
 		return
 	}
-	if !rn.requirePublicJoin(w, r) {
+	if !rn.publicJoinAuth.VerifyRequest(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
@@ -306,4 +277,58 @@ func (rn *RaftNode) HandleLeader(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		http.Error(w, fmt.Sprintf("Gagal meng-encode respons JSON: %v", err), http.StatusInternalServerError)
 	}
+}
+
+// HandleFedSend PUBLIC with simple token
+// Optional HTTP wrapper to trigger cross-cluster send via curl
+// POST /fed/send {"to":"cluster-b","sql":"INSERT ..."}
+func (rn *RaftNode) HandleFedSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Metode tidak diizinkan", http.StatusMethodNotAllowed)
+		return
+	}
+	if !rn.publicAuth.VerifyRequest(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var req struct {
+		To  string `json:"to"`
+		SQL string `json:"sql"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.To == "" || req.SQL == "" {
+		http.Error(w, "field 'to' dan 'sql' wajib diisi", http.StatusBadRequest)
+		return
+	}
+	if err := rn.sendSQLToCluster(req.To, req.SQL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("routed"))
+}
+
+func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
+
+// Committee helpers
+
+// HasCommittee menginisialisasi node komite jika belum ada.
+func (rn *RaftNode) HasCommittee() bool { return rn.committee != nil }
+
+// CommitteeHandleAnnounce meneruskan permintaan pengumuman ke node komite.
+func (rn *RaftNode) CommitteeHandleAnnounce(w http.ResponseWriter, r *http.Request) {
+	rn.committee.HandleAnnounce(w, r)
+}
+
+// CommitteeHandleRoute meneruskan permintaan ke node komite.
+func (rn *RaftNode) CommitteeHandleRoute(w http.ResponseWriter, r *http.Request) {
+	rn.committee.HandleRoute(w, r)
+}
+
+// CommitteeHandleList mengembalikan daftar cluster yang diketahui komite.
+func (rn *RaftNode) CommitteeHandleList(w http.ResponseWriter, r *http.Request) {
+	rn.committee.HandleList(w, r)
 }

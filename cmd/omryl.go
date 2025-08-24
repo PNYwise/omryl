@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/http"
 	"omryl/internal"
+	"omryl/internal/auth"
+	"omryl/internal/config"
 	"time"
 
 	// New import for hclog
@@ -49,7 +51,7 @@ func main() {
 	configPath := flag.String("config", "config.yaml", "path ke file config YAML")
 	flag.Parse()
 
-	cfg, err := internal.LoadConfig(*configPath)
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("Gagal load config: %v", err)
 	}
@@ -76,18 +78,42 @@ func main() {
 
 	// Wire auth options
 	if cfg.PublicAPIToken != "" {
-		node.SetPublicAPIToken(cfg.PublicAPIToken)
+		node.SetPublicAPIToken(&auth.PublicAuth{
+			PublicAPIToken: cfg.PublicAPIToken,
+		})
 	}
 	if cfg.PublicJoinToken != "" {
-		node.SetPublicJoinToken(cfg.PublicJoinToken)
+		node.SetPublicJoinToken(&auth.PublicJoinAuth{
+			PublicJoinAPIToken: cfg.PublicJoinToken,
+		})
 	}
 	if cfg.InternalSecret != "" {
-		node.SetInternalAuth(&internal.Auth{
+		node.SetInternalAuth(&auth.InternalAuth{
 			NodeID: cfg.InternalID,
 			Secret: cfg.InternalSecret,
 			Skew:   time.Duration(cfg.InternalClockSkewSec) * time.Second,
 			// Allowlist: map[string]bool{"node1": true, "node2": true, "node3": true},
 		})
+	}
+
+	// Attach Global Committee if configured
+	if cfg.CommitteeClusterID != "" {
+		err := node.AttachCommittee(
+			cfg.CommitteeClusterID,
+			cfg.HTTPAddr,
+			cfg.CommitteePeers,
+			&auth.InternalAuth{
+				NodeID: cfg.InternalID,
+				Secret: cfg.InternalSecret,
+				Skew:   time.Duration(cfg.InternalClockSkewSec) * time.Second,
+			})
+		if err != nil {
+			log.Fatalf("Gagal attach committee: %v", err)
+		}
+
+		node.SetFederation(cfg.FederatePurpose, cfg.FederateTargets)
+
+		go node.WatchLeadership()
 	}
 
 	log.Printf("Node %s dimulai. Alamat Raft: %s, Alamat HTTP: %s", cfg.NodeID, cfg.RaftAddr, cfg.HTTPAddr)
@@ -98,7 +124,18 @@ func main() {
 	http.HandleFunc("/join", node.HandleJoin)       // public/simple token (admin)
 	http.HandleFunc("/leader", node.HandleLeader)   // public
 
+	// Internal (strict HMAC)
 	http.HandleFunc("/propose", node.HandlePropose) // internal (strict HMAC)
+
+	// Optional: cross-cluster send via HTTP wrapper
+	http.HandleFunc("/fed/send", node.HandleFedSend) // public token required; forwards via committee
+
+	// Global Committee endpoints (if enabled)
+	if node.HasCommittee() {
+		http.HandleFunc("/gc/announce", node.CommitteeHandleAnnounce)
+		http.HandleFunc("/gc/route", node.CommitteeHandleRoute)
+		http.HandleFunc("/gc/list", node.CommitteeHandleList)
+	}
 
 	log.Printf("Server HTTP mendengarkan di: %s", cfg.HTTPAddr)
 	if err := http.ListenAndServe(cfg.HTTPAddr, nil); err != nil {

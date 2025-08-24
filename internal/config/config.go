@@ -1,4 +1,4 @@
-package internal
+package config
 
 import (
 	"fmt"
@@ -6,6 +6,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+// CommitteePeer merepresentasikan peer dalam komite.
+type CommitteePeer struct {
+	ID       string `yaml:"id" json:"id"`               // peer ID (site or region name)
+	HTTPAddr string `yaml:"http_addr" json:"http_addr"` // http addr of the committee endpoint on that peer
+}
 
 // Config mewakili konfigurasi untuk node Raft.
 type Config struct {
@@ -23,6 +29,14 @@ type Config struct {
 	InternalID           string `yaml:"internal_id"`
 	InternalSecret       string `yaml:"internal_secret"`
 	InternalClockSkewSec int    `yaml:"internal_clock_skew_sec"`
+
+	// Peers awal untuk bootstrap cluster
+	CommitteeClusterID string          `yaml:"committee_cluster_id"`
+	CommitteePeers     []CommitteePeer `yaml:"committee_peers"`
+
+	FederatePurpose bool     `yaml:"federate_purpose"`
+	FederateTargets []string `yaml:"federate_targets"` // optional: kosong = semua cluster selain diri sendiri
+
 }
 
 // LoadConfig memuat konfigurasi dari file YAML.

@@ -28,41 +28,11 @@ var _ raft.FSM = (*SQLiteFSM)(nil)
 // NewSQLiteFSM membuat instance SQLiteFSM baru dan menginisialisasi database.
 func NewSQLiteFSM(dbPath string) *SQLiteFSM {
 	fsm := &SQLiteFSM{dbPath: dbPath}
-
-	// Gunakan URI + PRAGMA di DSN agar pasti diterapkan pada koneksi pertama.
-	// Catatan: go-sqlite3 butuh "file:<path>?<params>" untuk URI.
-	dsn := fmt.Sprintf(
-		"file:%s?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL&_synchronous=NORMAL",
-		dbPath,
-	)
-
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLite(dbPath)
 	if err != nil {
-		log.Fatalf("Gagal membuka database SQLite untuk FSM: %v", err)
+		log.Fatalf("Gagal membuka database SQLite: %v", err)
 	}
-
-	// Pooling & concurrency:
-	// - 1 koneksi cukup untuk writer tunggal (Raft Apply), reader lokal juga jalan dengan WAL.
-	//   Naikkan jika benar-benar perlu, tapi hati-hati lock.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(0)
-
 	fsm.db = db
-
-	// (Opsional) PRAGMA tambahan; jika DSN sudah mengatur, ini jadi no-op.
-	if _, e := fsm.db.Exec(`PRAGMA journal_mode=WAL;`); e != nil {
-		log.Printf("PRAGMA WAL: %v", e)
-	}
-	if _, e := fsm.db.Exec(`PRAGMA synchronous=NORMAL;`); e != nil {
-		log.Printf("PRAGMA sync: %v", e)
-	}
-	if _, e := fsm.db.Exec(`PRAGMA foreign_keys=ON;`); e != nil {
-		log.Printf("PRAGMA fk: %v", e)
-	}
-	if _, e := fsm.db.Exec(`PRAGMA busy_timeout=5000;`); e != nil {
-		log.Printf("PRAGMA busy: %v", e)
-	}
 
 	// Schema
 	if _, err = fsm.db.Exec(`
@@ -173,38 +143,6 @@ func (fsm *SQLiteFSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &SQLiteSnapshot{snapshotPath: tmpName}, nil
 }
 
-// SQLiteSnapshot implementasi FSMSnapshot – salin file snapshot ke sink, lalu bersihkan.
-type SQLiteSnapshot struct {
-	snapshotPath string
-}
-
-var _ raft.FSMSnapshot = (*SQLiteSnapshot)(nil)
-
-// Persist menyalin snapshot ke sink Raft.
-func (s *SQLiteSnapshot) Persist(sink raft.SnapshotSink) error {
-	defer sink.Close()
-
-	src, err := os.Open(s.snapshotPath)
-	if err != nil {
-		sink.Cancel()
-		return fmt.Errorf("buka snapshot: %w", err)
-	}
-	defer src.Close()
-
-	if _, err := io.Copy(sink, src); err != nil {
-		sink.Cancel()
-		return fmt.Errorf("copy snapshot: %w", err)
-	}
-	return nil
-}
-
-// Release membersihkan snapshot file setelah disimpan.
-func (s *SQLiteSnapshot) Release() {
-	if s.snapshotPath != "" {
-		_ = os.Remove(s.snapshotPath)
-	}
-}
-
 // Restore timpa file DB dengan snapshot & reload lastApplied
 func (fsm *SQLiteFSM) Restore(rc io.ReadCloser) error {
 	fsm.mu.Lock()
@@ -239,8 +177,8 @@ func (fsm *SQLiteFSM) Restore(rc io.ReadCloser) error {
 		return fmt.Errorf("rename file restore: %w", err)
 	}
 
-	// Reopen DB dan reload meta
-	db, err := sql.Open("sqlite3", fsm.dbPath)
+	// Reopen dengan DSN yang sama (bukan plain path)
+	db, err := openSQLite(fsm.dbPath)
 	if err != nil {
 		return fmt.Errorf("buka DB setelah restore: %w", err)
 	}
@@ -249,6 +187,38 @@ func (fsm *SQLiteFSM) Restore(rc io.ReadCloser) error {
 
 	log.Printf("Restore selesai ke: %s (lastApplied=%d)", fsm.dbPath, fsm.lastApplied)
 	return nil
+}
+
+// SQLiteSnapshot implementasi FSMSnapshot – salin file snapshot ke sink, lalu bersihkan.
+type SQLiteSnapshot struct {
+	snapshotPath string
+}
+
+var _ raft.FSMSnapshot = (*SQLiteSnapshot)(nil)
+
+// Persist menyalin snapshot ke sink Raft.
+func (s *SQLiteSnapshot) Persist(sink raft.SnapshotSink) error {
+	defer sink.Close()
+
+	src, err := os.Open(s.snapshotPath)
+	if err != nil {
+		sink.Cancel()
+		return fmt.Errorf("buka snapshot: %w", err)
+	}
+	defer src.Close()
+
+	if _, err := io.Copy(sink, src); err != nil {
+		sink.Cancel()
+		return fmt.Errorf("copy snapshot: %w", err)
+	}
+	return nil
+}
+
+// Release membersihkan snapshot file setelah disimpan.
+func (s *SQLiteSnapshot) Release() {
+	if s.snapshotPath != "" {
+		_ = os.Remove(s.snapshotPath)
+	}
 }
 
 // --- util kecil ---
@@ -279,4 +249,25 @@ func limitLen(s string, n int) string {
 		return s
 	}
 	return s[:n] + "...(truncated)"
+}
+
+// Tambah helper reuse DSN:
+func openSQLite(dbPath string) (*sql.DB, error) {
+	dsn := fmt.Sprintf(
+		"file:%s?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL&_synchronous=NORMAL",
+		dbPath,
+	)
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	// (Opsional) PRAGMA redundan—tak masalah kalau dipanggil ulang:
+	_, _ = db.Exec(`PRAGMA journal_mode=WAL;`)
+	_, _ = db.Exec(`PRAGMA synchronous=NORMAL;`)
+	_, _ = db.Exec(`PRAGMA foreign_keys=ON;`)
+	_, _ = db.Exec(`PRAGMA busy_timeout=5000;`)
+	return db, nil
 }
