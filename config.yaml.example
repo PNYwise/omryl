@@ -1,6 +1,6 @@
 node_id: "node1"
 raft_addr: "127.0.0.1:8001"
-http_addr: "127.0.0.1:9001"
+http_addr: "0.0.0.0:9001"
 is_bootstrap: true
 
 public_api_token: "public-api-token"
@@ -9,3 +9,13 @@ public_join_token: "public-join-token"
 internal_id: "node1"
 internal_secret: "change-me-very-secret"
 internal_clock_skew_sec: 60
+
+committee_cluster_id: "indonesian-cluster"
+committee_peers:
+  - id: central
+    http_addr: 0.0.0.0:9001
+
+federate_purpose: true
+# federateTargets:
+#   - cluster-b
+#   - cluster-c
