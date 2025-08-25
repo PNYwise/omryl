@@ -79,6 +79,8 @@ func NewRaftNode(
 	// Konfigurasi Raft
 	config := raft.DefaultConfig()
 	config.LocalID = raft.ServerID(nodeID)
+	config.SnapshotInterval = 30 * time.Second // default bisa terlalu jarang
+	config.SnapshotThreshold = 1024            // apply 1k entry → snapshot
 	config.Logger = hclog.New(&hclog.LoggerOptions{
 		Name:   fmt.Sprintf("raft-%s", nodeID),
 		Output: os.Stderr,

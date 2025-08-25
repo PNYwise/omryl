@@ -120,8 +120,9 @@ func (fsm *SQLiteFSM) Apply(le *raft.Log) any {
 // Snapshot buat snapshot konsisten.
 // Gunakan VACUUM INTO jika ada (SQLite >= 3.27); fallback ke copy file biasa.
 func (fsm *SQLiteFSM) Snapshot() (raft.FSMSnapshot, error) {
-	fsm.mu.RLock() // read lock saja cukup; tulis diblok oleh Apply (Lock)
-	defer fsm.mu.RUnlock()
+	// CHANGE: pakai full Lock demi konsistensi ketika VACUUM/Checkpoint
+	fsm.mu.Lock()
+	defer fsm.mu.Unlock()
 
 	tmp, err := os.CreateTemp("", "sqlite_snapshot_*.db")
 	if err != nil {
@@ -130,10 +131,16 @@ func (fsm *SQLiteFSM) Snapshot() (raft.FSMSnapshot, error) {
 	tmpName := tmp.Name()
 	_ = tmp.Close()
 
-	// Coba VACUUM INTO untuk file yang koheren saat WAL
-	if _, err := fsm.db.Exec(`VACUUM INTO ?;`, tmpName); err != nil {
-		// Fallback: copy file
-		os.Remove(tmpName)
+	// gunakan literal yang di-quote
+	vacuumSQL := fmt.Sprintf(`VACUUM INTO %q;`, tmpName)
+	if _, err := fsm.db.Exec(vacuumSQL); err != nil {
+		// pastikan WAL ter-flush dulu sebelum fallback copy
+		// (TRUNCATE > FULL supaya wal file kosong)
+		_, _ = fsm.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`)
+
+		// Bersihkan file tmp yang dibuat sebelumnya
+		_ = os.Remove(tmpName)
+
 		if copyErr := copyFile(fsm.dbPath, tmpName); copyErr != nil {
 			return nil, fmt.Errorf("snapshot gagal (vacuum=%v, copy=%v)", err, copyErr)
 		}
@@ -198,8 +205,6 @@ var _ raft.FSMSnapshot = (*SQLiteSnapshot)(nil)
 
 // Persist menyalin snapshot ke sink Raft.
 func (s *SQLiteSnapshot) Persist(sink raft.SnapshotSink) error {
-	defer sink.Close()
-
 	src, err := os.Open(s.snapshotPath)
 	if err != nil {
 		sink.Cancel()
@@ -210,6 +215,9 @@ func (s *SQLiteSnapshot) Persist(sink raft.SnapshotSink) error {
 	if _, err := io.Copy(sink, src); err != nil {
 		sink.Cancel()
 		return fmt.Errorf("copy snapshot: %w", err)
+	}
+	if err := sink.Close(); err != nil {
+		return err
 	}
 	return nil
 }
